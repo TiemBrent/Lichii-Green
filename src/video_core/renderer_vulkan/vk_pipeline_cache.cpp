@@ -455,10 +455,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                 !DriverCachesPipelines(device_)},
       num_pipeline_workers{device.HasBrokenParallelShaderCompiling() ? 1ULL
                                                                      : GetTotalPipelineWorkers()},
-      emission_budget{num_pipeline_workers},
+      emission_budget{num_pipeline_workers * 2},
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
-      background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+      background_pipelines{128, 48 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1007,6 +1007,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             skipped_pipelines, deferred_pipelines);
     }
 
+    // Warm the deferred pipelines while the used-list ones still build: the prebuild pool is
+    // small and separate, so the overlap costs the loading screen a little and hands the game
+    // a deeper warm cache as soon as it starts. The Start below is then a no-op (guarded by
+    // `started`), and Stop still runs when the load was cancelled.
+    if (!stop_loading.stop_requested()) {
+        background_pipelines.Start(std::clamp<size_t>(num_pipeline_workers / 4, 2, 4));
+    }
+
     std::unique_lock lock{state.mutex};
     callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
     state.has_loaded = true;
@@ -1028,9 +1036,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     if (stop_loading.stop_requested()) {
         background_pipelines.Stop();
-    } else {
-        background_pipelines.Start(std::clamp<size_t>(num_pipeline_workers / 4, 1, 2));
     }
+    // The prebuild pool is normally already started above (see the early Start): draining the
+    // deferred set during the boot load means the first new area the game enters finds more
+    // of its pipelines built instead of paying the whole translate-plus-compile on the GPU
+    // thread. The pool stays bounded above (capacity + capture limit set in the constructor).
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
@@ -1122,7 +1132,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
-        pipeline = background_pipelines.Take(graphics_key);
+        // Wait for a prebuild that is already running instead of discarding its result and
+        // rebuilding the pipeline synchronously on this (GPU) thread.
+        pipeline = background_pipelines.Take(graphics_key, true);
         if (!pipeline) {
             pipeline = CreateGraphicsPipeline();
         }
@@ -1197,8 +1209,9 @@ void PipelineCache::EvictUnusedPipelines() {
 }
 
 /// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the
-/// draw may be skipped while it builds (asynchronous shaders; native draws only with
-/// EDEN_NX2_ASYNC_DISCARD=1). Each nullptr returned for an unbuilt pipeline is counted for the log.
+/// draw may be skipped while it builds (asynchronous shaders; native draws skip by default in this
+/// fork unless EDEN_NX2_ASYNC_DISCARD=0). Each nullptr returned for an unbuilt pipeline is counted
+/// for the log.
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
@@ -1206,14 +1219,17 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
-    // EDEN_NX2_ASYNC_DISCARD=1: skip native draws whose pipeline is still building instead of
-    // waiting for it (experimental; the draw may be missing for a frame or more).
-    /// Reads EDEN_NX2_ASYNC_DISCARD once and logs when it is on.
+    // EDEN_NX2_ASYNC_DISCARD skips native draws whose pipeline is still building instead of
+    // waiting for it. Default ON in this fork: on the user's NVIDIA-only build the compile
+    // stall in the first visit to an area is worse than the possible missing effect for a
+    // frame or two. Set EDEN_NX2_ASYNC_DISCARD=0 to go back to waiting for every draw.
     static const bool discard_native = [] {
         const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value != nullptr && value[0] == '1';
+        const bool enabled = value == nullptr || value[0] != '0';
         if (enabled) {
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines");
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines (default; "
+                     "set EDEN_NX2_ASYNC_DISCARD=0 to wait for them instead)");
         }
         return enabled;
     }();
@@ -1446,13 +1462,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return nullptr;
 }
 
-namespace {
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
 // emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
 // are logged, and the totals every 10 s, to tell how much of the stutter on new content is
-// translation.
+// translation. The shader list is only formatted when a log line will use it: every built
+// pipeline took this path once, and the string cost nothing there but is not free on the GPU
+// thread in an area that builds dozens of pipelines at once.
+template <typename Shaders>
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
-                           const std::string& shaders) {
+                           Shaders&& shaders_fn) {
     static std::chrono::steady_clock::duration total{};
     static u32 count{}, logged{};
     static auto window = std::chrono::steady_clock::now();
@@ -1467,7 +1485,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
         (elapsed > std::chrono::milliseconds{2} && logged < 400)) {
         ++logged;
         LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
-                 ms(elapsed), shaders);
+                 ms(elapsed), shaders_fn());
     }
     if (now - window > std::chrono::seconds{10}) {
         const auto take = [](auto& counter) {
@@ -1489,13 +1507,16 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
-        std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
-        for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
-            if (graphics_key.unique_hashes[stage] != 0) {
-                shaders += fmt::format(" s{}:{:016x}", stage, graphics_key.unique_hashes[stage]);
+        ReportRuntimePipeline("Graphics", begin, [this, begin_key = graphics_key] {
+            GraphicsPipelineCacheKey key_copy = begin_key;
+            std::string shaders = fmt::format("pipeline={:016x}", key_copy.Hash());
+            for (size_t stage = 0; stage < key_copy.unique_hashes.size(); ++stage) {
+                if (key_copy.unique_hashes[stage] != 0) {
+                    shaders += fmt::format(" s{}:{:016x}", stage, key_copy.unique_hashes[stage]);
+                }
             }
-        }
-        ReportRuntimePipeline("Graphics", begin, shaders);
+            return shaders;
+        });
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
@@ -1546,11 +1567,12 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
-        ReportRuntimePipeline("Compute", begin,
-                              fmt::format("pipeline={:016x} s6:{:016x} address={:#x}", key.Hash(),
-                                          key.unique_hash,
-                                          kepler_compute->regs.code_loc.Address() +
-                                              kepler_compute->launch_description.program_start));
+        ReportRuntimePipeline("Compute", begin, [&key, this] {
+            return fmt::format("pipeline={:016x} s6:{:016x} address={:#x}", key.Hash(),
+                               key.unique_hash,
+                               kepler_compute->regs.code_loc.Address() +
+                                   kepler_compute->launch_description.program_start);
+        });
     };
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};

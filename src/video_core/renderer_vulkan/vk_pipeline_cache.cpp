@@ -1462,32 +1462,37 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return nullptr;
 }
 
+namespace {
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
 // emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
 // are logged, and the totals every 10 s, to tell how much of the stutter on new content is
 // translation. The shader list is only formatted when a log line will use it: every built
 // pipeline took this path once, and the string cost nothing there but is not free on the GPU
 // thread in an area that builds dozens of pipelines at once.
+
+// The runtime-build counters are shared between the Graphics and Compute template
+// instantiations below, so the 10 s totals count both in one window.
+std::chrono::steady_clock::duration runtime_pipeline_total{};
+u32 runtime_pipeline_count{}, runtime_pipeline_logged{};
+auto runtime_pipeline_window = std::chrono::steady_clock::now();
+
 template <typename Shaders>
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
                            Shaders&& shaders_fn) {
-    static std::chrono::steady_clock::duration total{};
-    static u32 count{}, logged{};
-    static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
-    total += elapsed;
-    ++count;
+    runtime_pipeline_total += elapsed;
+    ++runtime_pipeline_count;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // Slow builds are always logged with their shaders, to find the programs that are slow to
     // translate.
     if (elapsed > std::chrono::milliseconds{100} ||
-        (elapsed > std::chrono::milliseconds{2} && logged < 400)) {
-        ++logged;
+        (elapsed > std::chrono::milliseconds{2} && runtime_pipeline_logged < 400)) {
+        ++runtime_pipeline_logged;
         LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
                  ms(elapsed), shaders_fn());
     }
-    if (now - window > std::chrono::seconds{10}) {
+    if (now - runtime_pipeline_window > std::chrono::seconds{10}) {
         const auto take = [](auto& counter) {
             return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};
         };
@@ -1495,11 +1500,12 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
                  "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
                  "{:.1f} ms of draws held for unbuilt pipelines",
-                 count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
+                 runtime_pipeline_count, ms(runtime_pipeline_total),
+                 ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
                  ms(GraphicsPipeline::TakeHoldTime()));
-        total = {};
-        count = 0;
-        window = now;
+        runtime_pipeline_total = {};
+        runtime_pipeline_count = 0;
+        runtime_pipeline_window = now;
     }
 }
 } // Anonymous namespace

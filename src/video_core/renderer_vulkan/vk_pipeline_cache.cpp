@@ -1513,7 +1513,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
-        ReportRuntimePipeline("Graphics", begin, [this, begin_key = graphics_key] {
+        ReportRuntimePipeline("Graphics", begin, [begin_key = graphics_key] {
             GraphicsPipelineCacheKey key_copy = begin_key;
             std::string shaders = fmt::format("pipeline={:016x}", key_copy.Hash());
             for (size_t stage = 0; stage < key_copy.unique_hashes.size(); ++stage) {
